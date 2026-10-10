@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataFusion Learning Flow Explorer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: { 50: '#f0f7ff', 100: '#e0effe', 500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8' },
+                    }
+                }
+            }
+        };
+    </script>
+    <style>
+        .tab-panel.hidden { display: none; }
+        .graph-viewport {
+            height: min(72vh, 720px);
+            overflow: hidden;
+            cursor: grab;
+            background: linear-gradient(180deg, #f8fafc 0%, #fff 100%);
+            border-radius: 0 0 0.75rem 0.75rem;
+            position: relative;
+        }
+        .graph-viewport:active { cursor: grabbing; }
+        .graph-world {
+            position: absolute;
+            left: 0; top: 0;
+            transform-origin: 0 0;
+            will-change: transform;
+        }
+        .dag-node {
+            position: absolute;
+            width: 220px;
+            min-height: 88px;
+            padding: 12px 14px;
+            border-radius: 12px;
+            border: 2px solid #e2e8f0;
+            background: #fff;
+            box-shadow: 0 1px 3px rgba(15,23,42,.08);
+            transition: box-shadow .15s, border-color .15s;
+            cursor: pointer;
+        }
+        .dag-node:hover { box-shadow: 0 8px 24px rgba(15,23,42,.12); border-color: #94a3b8; }
+        .dag-node.selected { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.25); }
+        .dag-node.in-order { border-width: 2px; }
+        .dag-node .order-badge {
+            position: absolute; top: -10px; left: -10px;
+            width: 28px; height: 28px; border-radius: 999px;
+            font-size: 12px; font-weight: 800; color: #fff;
+            display: flex; align-items: center; justify-content: center;
+        }
+        #edgeCanvas { position: absolute; left: 0; top: 0; pointer-events: none; }
+        .pipeline-card { flex: 0 0 200px; }
+        .pipeline-arrow { flex: 0 0 32px; align-self: center; text-slate-400; font-size: 22px; }
+        .code-scroll::-webkit-scrollbar { height: 8px; width: 8px; }
+        .code-scroll::-webkit-scrollbar-thumb { background: #64748b; border-radius: 4px; }
+        .nav-tab.active { color: #2563eb; background: #eff6ff; border-color: #bfdbfe; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased">
+
+    <header class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-slate-200 shadow-sm">
+        <div class="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 py-4">
+            <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                <div>
+                    <h1 class="text-2xl font-bold text-slate-900 tracking-tight">DataFusion learning explorer</h1>
+                    <p class="text-sm text-slate-600 mt-1 max-w-3xl leading-relaxed">
+                        Three views on the same system: <strong>how you learn</strong> (DAG + random topo sort),
+                        <strong>what happens per query</strong> (wide pipeline), and <strong>where <code class="text-xs bg-slate-100 px-1 rounded">helpers.rs</code> fits</strong> (catalog path).
+                        Pan/zoom the DAG; click any step for full context.
+                    </p>
+                </div>
+                <div class="flex flex-wrap gap-2 shrink-0">
+                    <button type="button" id="btnTopo" class="px-4 py-2.5 rounded-lg bg-brand-600 text-white text-sm font-semibold hover:bg-brand-700">
+                        ⟳ New random topological order
+                    </button>
+                    <button type="button" id="btnFit" class="px-4 py-2.5 rounded-lg bg-white border border-slate-300 text-sm font-medium hover:bg-slate-50">
+                        Fit DAG in view
+                    </button>
+                </div>
+            </div>
+            <nav class="flex flex-wrap gap-2 mt-4 text-sm font-medium">
+                <button type="button" data-tab="learn" class="nav-tab active px-4 py-2 rounded-lg border border-transparent">① Learning DAG</button>
+                <button type="button" data-tab="pipeline" class="nav-tab px-4 py-2 rounded-lg border border-transparent text-slate-600 hover:bg-slate-100">② Query pipeline</button>
+                <button type="button" data-tab="catalog" class="nav-tab px-4 py-2 rounded-lg border border-transparent text-slate-600 hover:bg-slate-100">③ Catalog &amp; pruning</button>
+                <button type="button" data-tab="story" class="nav-tab px-4 py-2 rounded-lg border border-transparent text-slate-600 hover:bg-slate-100">④ Big picture story</button>
+            </nav>
+        </div>
+    </header>
+
+    <main class="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+
+        <!-- TAB: Learning DAG -->
+        <section id="tab-learn" class="tab-panel">
+            <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                <div class="px-6 py-5 border-b border-slate-200">
+                    <h2 class="text-lg font-bold text-slate-900">Your learning journey (dependency graph)</h2>
+                    <p class="text-sm text-slate-600 mt-2 leading-relaxed max-w-4xl">
+                        Arrows mean <em>“understand or do A before B makes sense”</em> — not calendar order.
+                        Steps in the same column can often be swapped (CLI vs generating dummy data).
+                        <strong>Scroll wheel</strong> zooms; <strong>drag background</strong> pans.
+                        The numbered badges appear after you hit topological sort — each click picks a different valid order when ties exist.
+                    </p>
+                </div>
+                <div class="px-6 py-3 bg-slate-900 text-slate-300 text-xs flex flex-wrap gap-4">
+                    <span><span class="inline-block w-3 h-3 rounded bg-emerald-500 mr-1"></span> Use the tool</span>
+                    <span><span class="inline-block w-3 h-3 rounded bg-amber-500 mr-1"></span> Data in / out</span>
+                    <span><span class="inline-block w-3 h-3 rounded bg-blue-500 mr-1"></span> Query flow awareness</span>
+                    <span><span class="inline-block w-3 h-3 rounded bg-violet-500 mr-1"></span> Open one black box</span>
+                </div>
+                <div id="graphViewport" class="graph-viewport">
+                    <div id="graphWorld" class="graph-world">
+                        <canvas id="edgeCanvas"></canvas>
+                        <div id="nodeLayer"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB: Query pipeline -->
+        <section id="tab-pipeline" class="tab-panel hidden">
+            <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 sm:p-8">
+                <h2 class="text-lg font-bold text-slate-900">What happens when you run one SQL query</h2>
+                <p class="text-sm text-slate-600 mt-2 leading-relaxed max-w-4xl">
+                    This is the engine’s main highway — always the same shape. You do not learn this by reading
+                    <code class="text-xs bg-slate-100 px-1 rounded">helpers.rs</code> first; you learn it by running
+                    <code class="text-xs bg-slate-100 px-1 rounded">EXPLAIN</code> on a real query, then matching each stage to a crate.
+                    Click a card to load the same detail panel below.
+                </p>
+                <div class="mt-8 overflow-x-auto code-scroll pb-4">
+                    <div class="flex items-stretch gap-0 min-w-max px-2" id="pipelineRow"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB: Catalog -->
+        <section id="tab-catalog" class="tab-panel hidden">
+            <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-6">
+                <div>
+                    <h2 class="text-lg font-bold text-slate-900">Side path: listing tables &amp; partition pruning</h2>
+                    <p class="text-sm text-slate-600 mt-2 leading-relaxed max-w-4xl">
+                        You landed in <code class="font-mono text-xs bg-slate-100 px-1 rounded">catalog-listing/src/helpers.rs</code>
+                        because that file implements <strong>“can we skip reading whole folders of Parquet?”</strong>
+                        It only runs when (1) data was registered as a <strong>listing table</strong>,
+                        (2) the query has filters on <strong>partition columns</strong>, and (3) the optimizer pushed those filters down far enough.
+                    </p>
+                </div>
+                <div class="grid md:grid-cols-5 gap-3 text-sm">
+                    <button type="button" class="catalog-step text-left p-4 rounded-xl border-2 border-slate-200 hover:border-brand-400 bg-slate-50" data-id="register">
+                        <div class="font-bold text-slate-900">1. Register path</div>
+                        <p class="text-xs text-slate-600 mt-2">SQL points at a directory: <code class="bg-white px-1 rounded">/data/events/</code> with hive partitions <code class="bg-white px-1 rounded">year=2024/month=03/</code>.</p>
+                    </button>
+                    <button type="button" class="catalog-step text-left p-4 rounded-xl border-2 border-slate-200 hover:border-brand-400 bg-slate-50" data-id="listing">
+                        <div class="font-bold text-slate-900">2. Listing table</div>
+                        <p class="text-xs text-slate-600 mt-2">Catalog expands the path into many file groups + partition values — one logical table, many files.</p>
+                    </button>
+                    <button type="button" class="catalog-step text-left p-4 rounded-xl border-2 border-slate-200 hover:border-brand-400 bg-slate-50" data-id="optimizer">
+                        <div class="font-bold text-slate-900">3. Optimizer pushdown</div>
+                        <p class="text-xs text-slate-600 mt-2"><code class="bg-white px-1 rounded">WHERE year = 2024</code> becomes a constraint on which directories are eligible.</p>
+                    </button>
+                    <button type="button" class="catalog-step text-left p-4 rounded-xl border-2 border-slate-200 hover:border-brand-400 bg-slate-50" data-id="pruning">
+                        <div class="font-bold text-slate-900">4. Pruning decision</div>
+                        <p class="text-xs text-slate-600 mt-2">For each candidate pruning rule, check it only uses real partition column names — your line.</p>
+                    </button>
+                    <button type="button" class="catalog-step text-left p-4 rounded-xl border-2 border-slate-200 hover:border-brand-400 bg-slate-50" data-id="physical">
+                        <div class="font-bold text-slate-900">5. Parquet scan</div>
+                        <p class="text-xs text-slate-600 mt-2">Only surviving files are scanned; rows inside files are filtered separately.</p>
+                    </button>
+                </div>
+                <div class="rounded-xl bg-slate-900 text-slate-100 p-5 text-sm leading-relaxed font-mono text-xs overflow-x-auto code-scroll">
+                    <div class="text-brand-400 font-sans font-bold text-sm mb-2">The line you saw (in plain language)</div>
+                    <pre class="whitespace-pre-wrap">is_applicable &amp;= col_names.contains(&amp;name.as_str());
+
+// Meaning: "This pruning expression references column `name`.
+// If `name` is NOT one of the table's partition columns, the whole
+// rule is marked not applicable — don't use it to skip folders."
+// Why: otherwise a filter on a normal data column could be mistaken
+// for a partition key and you'd skip data incorrectly (wrong results).</pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB: Story -->
+        <section id="tab-story" class="tab-panel hidden">
+            <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 sm:p-8 prose prose-slate max-w-none">
+                <h2 class="text-xl font-bold text-slate-900 not-prose">What DataFusion is (60 seconds)</h2>
+                <p class="text-sm leading-relaxed text-slate-700">
+                    DataFusion is an <strong>embeddable query engine</strong> written in Rust. You embed it in a binary (or use the CLI) like you’d embed SQLite — but oriented toward <strong>analytical</strong> SQL over columnar data (Parquet, Arrow), not OLTP row storage.
+                    It is <strong>not</strong> a single running “database server” unless you build one on top.
+                </p>
+                <h3 class="text-base font-bold mt-6 not-prose">Two loops you care about</h3>
+                <ol class="text-sm space-y-3 text-slate-700 list-decimal list-inside">
+                    <li><strong>Outer loop (your learning):</strong> get dummy data → register → query → see results → EXPLAIN → pick one stage to read in source.</li>
+                    <li><strong>Inner loop (every query):</strong> parse SQL → logical plan → analyze → optimize → physical plan → execute in parallel → stream Arrow batches.</li>
+                </ol>
+                <h3 class="text-base font-bold mt-6 not-prose">Why the first DAG felt useless</h3>
+                <p class="text-sm leading-relaxed text-slate-700">
+                    Mixing both loops into one small canvas put 15 steps on 11 vertical layers with labels inside tiny circles — that was a layout failure, not the idea.
+                    This version separates views and gives each step a full paragraph when selected.
+                </p>
+                <h3 class="text-base font-bold mt-6 not-prose">Concrete first afternoon (suggested, not mandatory)</h3>
+                <ul class="text-sm space-y-2 text-slate-700 list-disc list-inside">
+                    <li>Build or download one Parquet file (even small).</li>
+                    <li>Run <code class="text-xs bg-slate-100 px-1 rounded">datafusion-cli</code> or a <code class="text-xs bg-slate-100 px-1 rounded">datafusion-examples</code> dataframe example.</li>
+                    <li><code class="text-xs bg-slate-100 px-1 rounded">CREATE EXTERNAL TABLE ... LOCATION '...'</code> or register API equivalent.</li>
+                    <li><code class="text-xs bg-slate-100 px-1 rounded">SELECT count(*) ...</code> then <code class="text-xs bg-slate-100 px-1 rounded">EXPLAIN</code> / <code class="text-xs bg-slate-100 px-1 rounded">EXPLAIN ANALYZE</code>.</li>
+                    <li>Only then open catalog-listing if your table is directory-partitioned.</li>
+                </ul>
+            </div>
+        </section>
+
+        <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+            <div class="xl:col-span-1 bg-white rounded-xl border border-slate-200 shadow-sm p-5">
+                <h3 class="text-sm font-bold text-slate-900">Topological order <span id="orderCount" class="text-brand-600 font-normal"></span></h3>
+                <p class="text-xs text-slate-500 mt-1 mb-4">Learning DAG only. Click a row to jump to that step’s details.</p>
+                <ol id="topoList" class="space-y-2 text-sm max-h-[420px] overflow-y-auto code-scroll"></ol>
+            </div>
+
+            <div class="xl:col-span-2 bg-white rounded-xl border border-slate-200 shadow-sm p-6 sm:p-8" id="detailPanel">
+                <div id="detailEmpty" class="text-sm text-slate-500">
+                    <p class="text-base font-semibold text-slate-800">Select a step</p>
+                    <p class="mt-2 leading-relaxed">Use the learning DAG, the horizontal pipeline, or the catalog row. Each step has: what it is, why it matters for heavy dummy data, what you do hands-on, and where it lives in your clone.</p>
+                </div>
+                <div id="detailContent" class="hidden space-y-5">
+                    <div>
+                        <span id="detailPhase" class="text-xs font-bold uppercase tracking-wider text-brand-600"></span>
+                        <h2 id="detailTitle" class="text-2xl font-bold text-slate-900 mt-1"></h2>
+                        <p id="detailSubtitle" class="text-sm text-slate-500 mt-1"></p>
+                    </div>
+                    <div class="grid md:grid-cols-2 gap-4 text-sm">
+                        <div class="p-4 rounded-lg bg-emerald-50 border border-emerald-100">
+                            <div class="font-bold text-emerald-900 text-xs uppercase mb-2">What it is</div>
+                            <p id="detailWhat" class="text-slate-700 leading-relaxed"></p>
+                        </div>
+                        <div class="p-4 rounded-lg bg-blue-50 border border-blue-100">
+                            <div class="font-bold text-blue-900 text-xs uppercase mb-2">Why it matters for you</div>
+                            <p id="detailWhy" class="text-slate-700 leading-relaxed"></p>
+                        </div>
+                    </div>
+                    <div class="p-4 rounded-lg bg-amber-50 border border-amber-100 text-sm">
+                        <div class="font-bold text-amber-900 text-xs uppercase mb-2">Hands-on (what you actually do)</div>
+                        <p id="detailHandsOn" class="text-slate-700 leading-relaxed"></p>
+                    </div>
+                    <div class="grid md:grid-cols-2 gap-4 text-sm">
+                        <div class="p-4 rounded-lg bg-slate-50 border border-slate-200">
+                            <div class="font-bold text-slate-800 text-xs uppercase mb-2">In your repo</div>
+                            <p id="detailPaths" class="font-mono text-xs text-slate-600 break-all leading-relaxed"></p>
+                        </div>
+                        <div class="p-4 rounded-lg bg-slate-50 border border-slate-200">
+                            <div class="font-bold text-slate-800 text-xs uppercase mb-2">Depends on → leads to</div>
+                            <p id="detailFlow" class="text-slate-600 leading-relaxed"></p>
+                        </div>
+                    </div>
+                    <pre id="detailSnippet" class="hidden p-4 rounded-lg bg-slate-900 text-slate-200 text-xs overflow-x-auto code-scroll font-mono leading-relaxed"></pre>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const PHASE = {
+            use: { color: '#059669', label: 'Use the tool' },
+            io: { color: '#d97706', label: 'Data in / out' },
+            flow: { color: '#2563eb', label: 'Query flow' },
+            deep: { color: '#7c3aed', label: 'Deep dive' },
+        };
+
+        const NODE_DATA = {
+            goal: {
+                label: 'Define the exercise',
+                subtitle: 'Before touching Rust',
+                phase: 'use',
+                x: 80, y: 80,
+                what: 'Decide what “heavy dummy data” means for you: row count, on-disk size, number of Parquet files, and whether you need partitions (hive-style folders) or a single file. Also pick one question: total count, filter+aggregate, or join.',
+                why: 'Without a target workload, you cannot tell if DataFusion is fast, correct, or memory-safe — you are just running demos. This anchors every later step.',
+                handsOn: 'Write down: (1) schema columns, (2) ~rows or GB, (3) one SQL you will run repeatedly, (4) whether data lives local or on SSH remote.',
+                paths: 'Notes: .vibe-wise/project-map.md',
+                flow: 'Start here → splits into generating data and learning the CLI in parallel.',
+            },
+            dummy: {
+                label: 'Generate dummy data',
+                subtitle: 'Parquet / CSV on disk',
+                phase: 'use',
+                x: 80, y: 280,
+                what: 'Synthetic files that stress the engine: many rows, optional partition directories (year=/month=), realistic column types (strings, ints, timestamps). The engine reads these; it does not generate them for you.',
+                why: 'Heavy data is how you learn pushdown, parallelism, and memory limits — not from empty tables.',
+                handsOn: 'Use a script, `datafusion-examples` csv_to_parquet helper, or Python/pyarrow on your Linux box for large runs. Keep Mac runs small (8GB RAM).',
+                paths: 'datafusion-examples/src/utils/csv_to_parquet.rs',
+                flow: 'After goal → before register. Can run in parallel with CLI exploration.',
+            },
+            cli: {
+                label: 'CLI & examples',
+                subtitle: 'Use the engine as a tool',
+                phase: 'use',
+                x: 380, y: 80,
+                what: 'datafusion-cli gives you a SQL shell. Examples under datafusion-examples are mini programs that construct a SessionContext and run queries — the same core as the CLI, with Rust glue visible.',
+                why: 'Matches your method: learn the tool and flows before reading optimizer source.',
+                handsOn: 'From repo: build datafusion-cli OR run one example from datafusion-examples/examples/dataframe/. Run SELECT 1; then register a file and query it.',
+                paths: 'datafusion-cli/, datafusion-examples/examples/dataframe/, datafusion-examples/examples/data_io/',
+                flow: 'After goal → feeds explain and first_query.',
+            },
+            register: {
+                label: 'Register tables',
+                subtitle: 'Names → data sources',
+                phase: 'io',
+                x: 380, y: 280,
+                what: 'SessionContext maps table names to TableProviders: single Parquet file, CSV, in-memory Arrow, or a listing over a directory tree. Registration is your programmatic input boundary.',
+                why: 'Every query references registered names. Listing registration is what eventually triggers catalog-listing and pruning code.',
+                handsOn: 'CLI: CREATE EXTERNAL TABLE ... LOCATION. Rust: ctx.register_parquet("t", path, ...). Confirm with SHOW TABLES.',
+                paths: 'datafusion/core/src/execution/context/',
+                flow: 'Needs data on disk → before SQL. Side branch to listing table deep dive.',
+            },
+            explain: {
+                label: 'EXPLAIN & metrics',
+                subtitle: 'X-ray without Rust',
+                phase: 'use',
+                x: 680, y: 80,
+                what: 'EXPLAIN shows logical and physical plans. EXPLAIN ANALYZE runs the query and prints runtime metrics (rows, batches, time per operator).',
+                why: 'This is the bridge from “tool user” to “follow one black box” — you see operator names that map to crates.',
+                handsOn: 'EXPLAIN SELECT ...; then EXPLAIN ANALYZE SELECT ...; save output and match operators to tab ② pipeline.',
+                paths: 'User guide: SQL EXPLAIN; examples in sql_ops/',
+                flow: 'After CLI → supports understanding logical/physical stages.',
+            },
+            first_query: {
+                label: 'First real query',
+                subtitle: 'Close the outer loop',
+                phase: 'flow',
+                x: 680, y: 280,
+                what: 'Run your chosen SQL (count, filter, group by, or join) and verify results make sense on a small slice before scaling data.',
+                why: 'Proves register + SQL + execution + output path works end-to-end.',
+                handsOn: 'Same query on 1k rows then scale on remote. Compare runtime and memory.',
+                paths: 'N/A — your SQL',
+                flow: 'After register + CLI → unlocks pipeline study and programmatic I/O.',
+            },
+            pipeline_map: {
+                label: 'Map the pipeline',
+                subtitle: 'Tab ② — inner loop',
+                phase: 'flow',
+                x: 980, y: 180,
+                what: 'Walk the fixed chain: SQL → logical → analyzer → optimizer → physical → execution → Arrow batches. Each stage is a different crate responsibility.',
+                why: 'Whole-system learning: you know where time is spent and where to set breakpoints.',
+                handsOn: 'Open tab ②; click each card while re-running EXPLAIN on the same query.',
+                paths: 'See pipeline tab cards',
+                flow: 'After first_query → before opening any single crate.',
+            },
+            prog_io: {
+                label: 'Programmatic I/O',
+                subtitle: 'Rust / Python bindings',
+                phase: 'io',
+                x: 980, y: 380,
+                what: 'Beyond CLI: build SessionContext in code, register sources, execute DataFrame or SQL, collect or stream RecordBatches, optionally write results.',
+                why: 'This is how you embed DataFusion in a product or pipeline — inputs and outputs are explicit.',
+                handsOn: 'Copy a minimal example; change only register path and SQL; print batch schema.',
+                paths: 'datafusion-examples/examples/dataframe/dataframe.rs',
+                flow: 'After first_query → optional before deep dive.',
+            },
+            black_box: {
+                label: 'Choose one black box',
+                subtitle: 'Detective mode',
+                phase: 'deep',
+                x: 1280, y: 280,
+                what: 'Pick one operator from EXPLAIN (e.g. HashAggregateExec, ParquetExec, FilterExec) or one subsystem (catalog-listing). Read only that path until you can explain one bug-shaped question.',
+                why: 'Prevents drowning in 50 crates; matches your “follow the black box” approach.',
+                handsOn: 'Set a breakpoint or add tracing; grep the Exec name in physical-plan/.',
+                paths: 'datafusion/physical-plan/, or catalog-listing/ for pruning',
+                flow: 'After pipeline_map → optional pruning branch if using partitioned listing tables.',
+            },
+            listing: {
+                label: 'Listing table',
+                subtitle: 'One table, many files',
+                phase: 'deep',
+                x: 1280, y: 480,
+                what: 'A table definition that scans a directory tree, inferring partitions from paths. The catalog-listing crate expands metadata and hands file lists to the planner.',
+                why: 'Heavy analytics almost always uses folder-partitioned Parquet — this is production shape.',
+                handsOn: 'Lay out dummy/data/year=2024/*.parquet; register as listing; query with partition filter.',
+                paths: 'datafusion/catalog-listing/',
+                flow: 'Optional from register → leads to pruning.',
+            },
+            pruning: {
+                label: 'Partition pruning',
+                subtitle: 'helpers.rs territory',
+                phase: 'deep',
+                x: 1580, y: 480,
+                what: 'At plan time, eliminate partition directories that cannot contain matching rows. Expressions must only use real partition column names — the line you saw enforces that.',
+                why: 'Wrong pruning skips files → wrong answers. This code is about safety of skipping I/O.',
+                handsOn: 'EXPLAIN a query with WHERE on partition cols; see fewer scan files. Read helpers.rs with tab ③ open.',
+                paths: 'datafusion/catalog-listing/src/helpers.rs',
+                flow: 'After listing + optimizer pushdown context.',
+                snippet: 'is_applicable &= col_names.contains(&name.as_str());\n// Rule applies only if every column in the pruning\n// expression exists in the partition schema.',
+            },
+            // Pipeline-only nodes (shared detail)
+            sql: {
+                label: 'SQL / DataFrame API',
+                subtitle: 'Entry point',
+                phase: 'flow',
+                what: 'Text SQL or fluent DataFrame API. Both build the same logical plan structure.',
+                why: 'This is what you author; everything below is derived.',
+                handsOn: 'ctx.sql("SELECT ...").await?',
+                paths: 'datafusion/sql/, datafusion/core/src/dataframe/',
+                flow: '→ logical plan',
+            },
+            logical: {
+                label: 'Logical plan',
+                subtitle: 'Relational algebra tree',
+                phase: 'flow',
+                what: 'Tree of TableScan, Filter, Project, Aggregate, Join — machine-independent, no threads yet.',
+                why: 'Optimizer rules target this IR.',
+                handsOn: 'EXPLAIN (without ANALYZE) — first plan printed.',
+                paths: 'datafusion/expr/, datafusion/logical-plan/',
+                flow: 'SQL → analyzer',
+            },
+            analyzer: {
+                label: 'Analyzer',
+                subtitle: 'Make the plan valid',
+                phase: 'flow',
+                what: 'Type coercion, resolve names, decorrelate subqueries — still logical.',
+                why: 'Your SQL must become a well-typed plan before optimization.',
+                handsOn: 'Compare EXPLAIN before/after analyzer rules (advanced); usually just know it exists.',
+                paths: 'datafusion/optimizer/src/analyzer/',
+                flow: 'logical → optimizer',
+            },
+            optimizer: {
+                label: 'Optimizer',
+                subtitle: 'Cheaper equivalent plan',
+                phase: 'flow',
+                what: 'Predicate pushdown, projection pruning, join reorder, limit pushdown — reduces data read and moved.',
+                why: 'Heavy data performance lives here + physical exec.',
+                handsOn: 'EXPLAIN and look for Filter pushed near Scan.',
+                paths: 'datafusion/optimizer/',
+                flow: '→ physical plan; connects to partition pruning for listing tables',
+            },
+            physical: {
+                label: 'Physical plan',
+                subtitle: 'Executable operators',
+                phase: 'flow',
+                what: 'ParquetExec, HashAggregateExec, SortExec, CoalescePartitions, etc. Includes partitioning and parallelism hints.',
+                why: 'EXPLAIN PHYSICAL shows what actually runs on thread pools.',
+                handsOn: 'Match Exec names to files in physical-plan/src/',
+                paths: 'datafusion/physical-plan/',
+                flow: '→ execution',
+            },
+            execute: {
+                label: 'Execution',
+                subtitle: 'Tokio + streaming',
+                phase: 'flow',
+                what: 'Runs the physical plan, pulls batches through operators, may spill to disk under memory pressure.',
+                why: 'Where wall-clock time and RAM spikes show up.',
+                handsOn: 'EXPLAIN ANALYZE metrics; memory_pool examples in execution_monitoring/',
+                paths: 'datafusion/execution/, datafusion/physical-plan/',
+                flow: '→ RecordBatches',
+            },
+            arrow_out: {
+                label: 'Arrow RecordBatches',
+                subtitle: 'Your output',
+                phase: 'io',
+                what: 'Columnar chunks (Arrow format) streamed or collected. Downstream: Pandas, Polars, write Parquet, etc.',
+                why: 'Programmatic output boundary — same as input format family.',
+                handsOn: '.collect()? or execute_stream(); inspect schema and row counts.',
+                paths: 'arrow crate; DataFrame collect APIs',
+                flow: 'End of inner loop per query',
+            },
+        };
+
+        const LEARN_NODES = ['goal','dummy','cli','register','explain','first_query','pipeline_map','prog_io','black_box','listing','pruning'];
+        const LEARN_EDGES = [
+            ['goal','dummy'],['goal','cli'],
+            ['dummy','register'],['cli','explain'],['cli','first_query'],
+            ['register','first_query'],['register','listing'],
+            ['explain','pipeline_map'],['first_query','pipeline_map'],
+            ['first_query','prog_io'],['pipeline_map','black_box'],
+            ['listing','pruning'],['black_box','pruning'],
+        ];
+
+        const PIPELINE_ORDER = ['register','sql','logical','analyzer','optimizer','physical','execute','arrow_out'];
+
+        let selectedId = null;
+        let highlightOrder = [];
+        let pan = { x: 40, y: 40 };
+        let zoom = 0.92;
+        let dragging = false;
+        let dragStart = null;
+
+        function nodeEl(id) {
+            const n = NODE_DATA[id];
+            const ph = PHASE[n.phase];
+            const div = document.createElement('div');
+            div.className = 'dag-node';
+            div.dataset.id = id;
+            div.style.left = n.x + 'px';
+            div.style.top = n.y + 'px';
+            div.innerHTML = `
+                <div class="order-badge hidden" style="background:${ph.color}"></div>
+                <div class="text-[10px] font-bold uppercase tracking-wide" style="color:${ph.color}">${ph.label}</div>
+                <div class="text-sm font-bold text-slate-900 mt-1 leading-snug">${n.label}</div>
+                <div class="text-xs text-slate-500 mt-1">${n.subtitle || ''}</div>
+            `;
+            div.addEventListener('click', (e) => { e.stopPropagation(); selectNode(id); });
+            return div;
+        }
+
+        function buildLearnGraph() {
+            const layer = document.getElementById('nodeLayer');
+            layer.innerHTML = '';
+            LEARN_NODES.forEach(id => layer.appendChild(nodeEl(id)));
+            requestAnimationFrame(drawEdges);
+        }
+
+        function nodeCenter(id) {
+            const n = NODE_DATA[id];
+            return { x: n.x + 110, y: n.y + 44 };
+        }
+
+        function drawEdges() {
+            const canvas = document.getElementById('edgeCanvas');
+            const world = document.getElementById('graphWorld');
+            const w = 1750, h = 620;
+            canvas.width = w;
+            canvas.height = h;
+            canvas.style.width = w + 'px';
+            canvas.style.height = h + 'px';
+            world.style.width = w + 'px';
+            world.style.height = h + 'px';
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, w, h);
+            const optional = new Set(['register->listing','listing->pruning','black_box->pruning','prog_io->black_box'].map(s=>s));
+            LEARN_EDGES.forEach(([u,v]) => {
+                const a = nodeCenter(u);
+                const b = nodeCenter(v);
+                const key = u+'->'+v;
+                const dashed = optional.has(key) || v === 'listing' || v === 'pruning';
+                ctx.beginPath();
+                ctx.moveTo(a.x, a.y);
+                const cx = (a.x + b.x) / 2;
+                ctx.bezierCurveTo(cx, a.y, cx, b.y, b.x, b.y);
+                ctx.strokeStyle = dashed ? '#cbd5e1' : '#64748b';
+                ctx.lineWidth = dashed ? 1.5 : 2.5;
+                if (dashed) ctx.setLineDash([8,6]);
+                else ctx.setLineDash([]);
+                ctx.stroke();
+            });
+            ctx.setLineDash([]);
+        }
+
+        function applyTransform() {
+            document.getElementById('graphWorld').style.transform = `translate(${pan.x}px,${pan.y}px) scale(${zoom})`;
+        }
+
+        function fitView() {
+            const vp = document.getElementById('graphViewport');
+            const w = 1750, h = 620;
+            const pad = 24;
+            zoom = Math.min((vp.clientWidth - pad*2) / w, (vp.clientHeight - pad*2) / h, 1.1);
+            pan.x = (vp.clientWidth - w * zoom) / 2;
+            pan.y = (vp.clientHeight - h * zoom) / 2;
+            applyTransform();
+        }
+
+        function randomTopologicalSort() {
+            const nodes = LEARN_NODES;
+            const adj = new Map(); const indeg = new Map();
+            nodes.forEach(id => { adj.set(id, []); indeg.set(id, 0); });
+            LEARN_EDGES.forEach(([u,v]) => { adj.get(u).push(v); indeg.set(v, indeg.get(v)+1); });
+            const ready = []; indeg.forEach((d,id) => { if (d===0) ready.push(id); });
+            const order = [];
+            while (ready.length) {
+                const i = Math.floor(Math.random() * ready.length);
+                const u = ready.splice(i, 1)[0];
+                order.push(u);
+                adj.get(u).forEach(v => {
+                    indeg.set(v, indeg.get(v)-1);
+                    if (indeg.get(v)===0) ready.push(v);
+                });
+            }
+            return order;
+        }
+
+        function updateOrderUI(order) {
+            highlightOrder = order;
+            document.getElementById('orderCount').textContent = `(${order.length} steps)`;
+            const idx = new Map(order.map((id,i)=>[id,i]));
+            document.querySelectorAll('.dag-node').forEach(el => {
+                const id = el.dataset.id;
+                const badge = el.querySelector('.order-badge');
+                const i = idx.get(id);
+                if (i !== undefined) {
+                    badge.textContent = i + 1;
+                    badge.classList.remove('hidden');
+                    el.classList.add('in-order');
+                    el.style.borderColor = PHASE[NODE_DATA[id].phase].color;
+                } else {
+                    badge.classList.add('hidden');
+                    el.classList.remove('in-order');
+                    el.style.borderColor = '';
+                }
+                el.classList.toggle('selected', id === selectedId);
+            });
+            const ol = document.getElementById('topoList');
+            ol.innerHTML = order.map((id, i) => {
+                const n = NODE_DATA[id];
+                const c = PHASE[n.phase].color;
+                return `<li class="p-3 rounded-lg border border-slate-100 hover:bg-slate-50 cursor-pointer" data-id="${id}">
+                    <div class="flex gap-3">
+                        <span class="w-7 h-7 shrink-0 rounded-full text-white text-xs font-bold flex items-center justify-center" style="background:${c}">${i+1}</span>
+                        <div>
+                            <div class="font-semibold text-slate-900">${n.label}</div>
+                            <div class="text-xs text-slate-500 mt-0.5 leading-relaxed">${(n.what||'').slice(0, 120)}…</div>
+                        </div>
+                    </div>
+                </li>`;
+            }).join('');
+            ol.querySelectorAll('li').forEach(li => li.addEventListener('click', () => selectNode(li.dataset.id)));
+            drawEdges();
+        }
+
+        function selectNode(id) {
+            selectedId = id;
+            const n = NODE_DATA[id];
+            if (!n) return;
+            document.getElementById('detailEmpty').classList.add('hidden');
+            document.getElementById('detailContent').classList.remove('hidden');
+            document.getElementById('detailPhase').textContent = PHASE[n.phase].label;
+            document.getElementById('detailTitle').textContent = n.label;
+            document.getElementById('detailSubtitle').textContent = n.subtitle || '';
+            document.getElementById('detailWhat').textContent = n.what || '';
+            document.getElementById('detailWhy').textContent = n.why || '';
+            document.getElementById('detailHandsOn').textContent = n.handsOn || '';
+            document.getElementById('detailPaths').textContent = n.paths || '—';
+            document.getElementById('detailFlow').textContent = n.flow || '—';
+            const sn = document.getElementById('detailSnippet');
+            if (n.snippet) { sn.textContent = n.snippet; sn.classList.remove('hidden'); }
+            else sn.classList.add('hidden');
+            document.querySelectorAll('.dag-node').forEach(el => el.classList.toggle('selected', el.dataset.id === id));
+            if (highlightOrder.length) updateOrderUI(highlightOrder);
+        }
+
+        function buildPipeline() {
+            const row = document.getElementById('pipelineRow');
+            row.innerHTML = '';
+            PIPELINE_ORDER.forEach((id, i) => {
+                const n = NODE_DATA[id];
+                const card = document.createElement('button');
+                card.type = 'button';
+                card.className = 'pipeline-card text-left p-4 rounded-xl border-2 border-slate-200 hover:border-brand-500 bg-white shadow-sm';
+                card.innerHTML = `
+                    <div class="text-[10px] font-bold uppercase text-brand-600">Step ${i+1}</div>
+                    <div class="font-bold text-slate-900 mt-1">${n.label}</div>
+                    <div class="text-xs text-slate-500 mt-2 leading-relaxed line-clamp-4">${n.what}</div>
+                `;
+                card.addEventListener('click', () => selectNode(id));
+                row.appendChild(card);
+                if (i < PIPELINE_ORDER.length - 1) {
+                    const ar = document.createElement('div');
+                    ar.className = 'pipeline-arrow';
+                    ar.textContent = '→';
+                    row.appendChild(ar);
+                }
+            });
+        }
+
+        function setupTabs() {
+            document.querySelectorAll('.nav-tab').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+                    document.getElementById('tab-' + btn.dataset.tab).classList.remove('hidden');
+                    if (btn.dataset.tab === 'learn') requestAnimationFrame(() => { drawEdges(); fitView(); });
+                });
+            });
+            document.querySelectorAll('.catalog-step').forEach(btn => {
+                btn.addEventListener('click', () => selectNode(btn.dataset.id));
+            });
+        }
+
+        function setupPanZoom() {
+            const vp = document.getElementById('graphViewport');
+            vp.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                const delta = e.deltaY > 0 ? 0.92 : 1.08;
+                zoom = Math.min(2, Math.max(0.35, zoom * delta));
+                applyTransform();
+            }, { passive: false });
+            vp.addEventListener('mousedown', (e) => {
+                if (e.target.closest('.dag-node')) return;
+                dragging = true;
+                dragStart = { x: e.clientX - pan.x, y: e.clientY - pan.y };
+            });
+            window.addEventListener('mousemove', (e) => {
+                if (!dragging) return;
+                pan.x = e.clientX - dragStart.x;
+                pan.y = e.clientY - dragStart.y;
+                applyTransform();
+            });
+            window.addEventListener('mouseup', () => { dragging = false; });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            buildLearnGraph();
+            buildPipeline();
+            setupTabs();
+            setupPanZoom();
+            document.getElementById('btnTopo').addEventListener('click', () => updateOrderUI(randomTopologicalSort()));
+            document.getElementById('btnFit').addEventListener('click', fitView);
+            updateOrderUI(randomTopologicalSort());
+            fitView();
+            selectNode('goal');
+        });
+    </script>
+</body>
+</html>
